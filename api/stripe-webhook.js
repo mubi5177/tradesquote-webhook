@@ -1,10 +1,6 @@
-// Place this file in the tradesquote-webhook GitHub repo
-// Path: api/stripe-webhook.js
-
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const admin = require('firebase-admin');
 
-// ─── Firebase Admin initialisation guard ─────────────────────────────────────
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -17,14 +13,8 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// ─── Disable Vercel body parsing (required for Stripe signature verification) ─
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+export const config = { api: { bodyParser: false } };
 
-// ─── Helper: read raw body from request stream ───────────────────────────────
 function getRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -34,75 +24,73 @@ function getRawBody(req) {
   });
 }
 
-// ─── Main webhook handler ────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  // 1. Reject non-POST requests
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-  const sig = req.headers['stripe-signature'];
-
   let event;
-
   try {
-    // 2. Read raw body
     const rawBody = await getRawBody(req);
-
-    // 3. Verify Stripe signature
-    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(
+      rawBody,
+      req.headers['stripe-signature'],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
   } catch (err) {
-    console.error('⚠️  Webhook signature verification failed:', err.message);
-    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
+    console.error('Signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  const object = event.data.object;
-
-  // 4. Extract Firebase UID from client_reference_id or metadata
+  const obj = event.data.object;
   const uid =
-    object.client_reference_id ||
-    object.metadata?.firebaseUID ||
+    obj.client_reference_id ||
+    obj.metadata?.firebaseUID ||
     null;
 
-  // 5. If no UID, log and return 200 (don't error — some events won't have uid)
   if (!uid) {
-    console.warn(
-      `⚠️  No UID found for event ${event.type} (${event.id}). Skipping Firestore update.`
-    );
+    console.warn(`No UID in event ${event.type} (${event.id})`);
     return res.status(200).json({ received: true, warning: 'No UID found' });
   }
 
-  // 6. Get Firestore user document reference
   const userRef = db.collection('users').doc(uid);
 
   try {
-    // 7. Handle event types
     switch (event.type) {
+
+      case 'checkout.session.completed': {
+        if (obj.mode === 'subscription' && obj.subscription) {
+          const sub = await stripe.subscriptions.retrieve(obj.subscription);
+          const interval = sub.items?.data?.[0]?.price?.recurring?.interval;
+          const periodEnd = new Date(sub.current_period_end * 1000);
+          await userRef.update({
+            subscriptionStatus: 'active',
+            subscriptionPlan: interval === 'year' ? 'annual' : 'monthly',
+            subscriptionPeriodEnd: admin.firestore.Timestamp.fromDate(periodEnd),
+            stripeCustomerId: obj.customer,
+            stripeSubscriptionId: obj.subscription,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`✓ checkout.session.completed — activated for UID: ${uid}`);
+        }
+        break;
+      }
+
       case 'customer.subscription.created':
       case 'customer.subscription.updated': {
-        const subscription = object;
-        const status = subscription.status;
-        const interval = subscription.items?.data?.[0]?.price?.recurring?.interval || 'month';
-        const currentPeriodEnd = new Date(subscription.current_period_end * 1000);
-
-        const subscriptionStatus =
-          status === 'active' || status === 'trialing' ? 'active' : 'expired';
-
+        const isActive = obj.status === 'active' || obj.status === 'trialing';
+        const interval = obj.items?.data?.[0]?.price?.recurring?.interval;
+        const periodEnd = new Date(obj.current_period_end * 1000);
         await userRef.update({
-          subscriptionStatus,
+          subscriptionStatus: isActive ? 'active' : 'expired',
           subscriptionPlan: interval === 'year' ? 'annual' : 'monthly',
-          subscriptionPeriodEnd: admin.firestore.Timestamp.fromDate(currentPeriodEnd),
-          stripeCustomerId: subscription.customer,
-          stripeSubscriptionId: subscription.id,
-          stripePriceId: subscription.items?.data?.[0]?.price?.id || null,
+          subscriptionPeriodEnd: admin.firestore.Timestamp.fromDate(periodEnd),
+          stripeCustomerId: obj.customer,
+          stripeSubscriptionId: obj.id,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
-        console.log(
-          `✅ Subscription ${event.type} — UID: ${uid}, Status: ${subscriptionStatus}, Plan: ${interval}`
-        );
+        console.log(`✓ ${event.type} — UID: ${uid}, Status: ${isActive ? 'active' : 'expired'}`);
         break;
       }
 
@@ -114,24 +102,18 @@ module.exports = async function handler(req, res) {
           stripeSubscriptionId: null,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
-        console.log(`✅ Subscription deleted — UID: ${uid}`);
+        console.log(`✓ Subscription deleted — UID: ${uid}`);
         break;
       }
 
       case 'invoice.payment_succeeded': {
-        const invoice = object;
-
         await userRef.update({
           subscriptionStatus: 'active',
           lastPaymentDate: admin.firestore.FieldValue.serverTimestamp(),
-          lastInvoiceAmount: invoice.amount_paid || 0,
+          lastInvoiceAmount: obj.amount_paid || 0,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
-        console.log(
-          `✅ Payment succeeded — UID: ${uid}, Amount: ${invoice.amount_paid}`
-        );
+        console.log(`✓ Payment succeeded — UID: ${uid}, Amount: ${obj.amount_paid}`);
         break;
       }
 
@@ -141,20 +123,17 @@ module.exports = async function handler(req, res) {
           lastPaymentFailedAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-
-        console.log(`⚠️  Payment failed — UID: ${uid}`);
+        console.log(`⚠ Payment failed — UID: ${uid}`);
         break;
       }
 
       default:
-        console.log(`ℹ️  Unhandled event type: ${event.type}`);
+        console.log(`Unhandled event type: ${event.type}`);
     }
 
-    // 8. Return success
     return res.status(200).json({ received: true });
   } catch (err) {
-    // 9. Catch Firestore errors — return 500 so Stripe retries
-    console.error(`❌ Firestore error for event ${event.type}:`, err);
+    console.error(`Firestore error for event ${event.type}:`, err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 };
